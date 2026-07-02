@@ -1,0 +1,45 @@
+# === Keil MDK build artifacts ===
+*.o
+*.d
+*.crf
+*.axf
+*.hex
+*.htm
+*.lnp
+*.map
+*.build_log.htm
+*.dep
+build.log
+rebuild.log
+JLinkLog.txt
+JLinkSettings.ini
+*.uvguix.*
+*.scvd
+
+# === Compiled outputs ===
+keil/Objects/
+keil/Listings/
+keil/*.map
+
+# === Editor / OS ===
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# === Temp / reference code (not yours) ===
+tmp/
+
+# === Codex local state ===
+.codex/
+
+# === Agent local state ===
+.agents/
+
+# === SysConfig generated (committed manually when stable) ===
+# Uncomment if you want to track generated files:
+# firmware/bringup/ti_msp_dl_config.c
+# firmware/bringup/ti_msp_dl_config.h
+# firmware/bringup/empty.syscfg

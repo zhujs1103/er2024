@@ -408,6 +408,16 @@
               <FileType>1</FileType>
               <FilePath>../ti_msp_dl_config.c</FilePath>
             </File>
+            <File>
+              <FileName>mpu6050_straight.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../mpu6050_straight.c</FilePath>
+            </File>
+            <File>
+              <FileName>mpu6050_straight.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>../mpu6050_straight.h</FilePath>
+            </File>
           </Files>
         </Group>
       </Groups>

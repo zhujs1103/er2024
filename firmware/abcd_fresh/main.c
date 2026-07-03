@@ -54,6 +54,7 @@
  */
 
 #include "ti_msp_dl_config.h"
+#include "mpu6050_straight.h"
 
 #include <stdint.h>
 
@@ -92,13 +93,13 @@
 #define STEP7_GAP_BALANCE_SPEED_KP_NUM (250)
 #define STEP7_GAP_BALANCE_SPEED_KP_DEN (100)
 #define STEP7_GAP_BALANCE_MAX          (150)
-#define STEP7_GAP_BALANCE_BIAS_DEFAULT (30)
+#define STEP7_GAP_BALANCE_BIAS_DEFAULT (15)
 #define STEP7_GAP_BALANCE_BIAS_MIN     (0)
 #define STEP7_GAP_BALANCE_BIAS_MAX     (100)
 #define STEP7_GAP_BALANCE_BIAS_STEP    (5)
 #define STEP7_GAP_BLACK_CONFIRM_TICKS  (3U)
 
-#define ER2024_FW_BUILD_TAG "2026-07-03-abcd-fresh-from-fg"
+#define ER2024_FW_BUILD_TAG "2026-07-03-abcd-fresh-y-enc-imu"
 
 #define ABCD_ENTRY_GUARD_TICKS      (160)
 #define ABCD_ACQUIRE_MAX_TICKS      (900)
@@ -137,6 +138,7 @@ typedef enum {
     DRIVE_JOG_FWD,
     DRIVE_JOG_REV,
     DRIVE_GAP_TO_BLACK,
+    DRIVE_IMU_STRAIGHT,
     DRIVE_AUTO
 } drive_mode_t;
 
@@ -195,6 +197,8 @@ static int16_t       g_pidKp          = STEP6_KP_DEFAULT;
 static int16_t       g_pidKi          = STEP6_KI_DEFAULT;
 static int16_t       g_pidKd          = STEP6_KD_DEFAULT;
 static int16_t       g_lastCorrection = 0;
+static int16_t       g_lastStraightCorrection = 0;
+static int16_t       g_lastImuCorrection = 0;
 static int16_t       g_lastLeftCmd    = 0;
 static int16_t       g_lastRightCmd   = 0;
 static int32_t       g_lapTargetTicks = STEP7_LAP_TARGET_TICKS_DEFAULT;
@@ -315,6 +319,8 @@ static const char *driveModeName(drive_mode_t mode)
             return "REV";
         case DRIVE_GAP_TO_BLACK:
             return "GAP";
+        case DRIVE_IMU_STRAIGHT:
+            return "IMU";
         case DRIVE_AUTO:
             return "AUTO";
         case DRIVE_STANDBY:
@@ -768,6 +774,8 @@ static void linePid_reset(void)
     g_pidPrevError   = 0;
     g_pidIntegral    = 0;
     g_lastCorrection = 0;
+    g_lastStraightCorrection = 0;
+    g_lastImuCorrection = 0;
     g_lastLeftCmd    = 0;
     g_lastRightCmd   = 0;
     g_lineLostTicks  = 0U;
@@ -795,7 +803,9 @@ static int16_t linePid_calculate(int16_t error)
 
 static void step7_gapDriveStraight(void)
 {
-    g_lastCorrection = step7_gapStraightCorrection();
+    g_lastStraightCorrection = step7_gapStraightCorrection();
+    g_lastImuCorrection = 0;
+    g_lastCorrection = g_lastStraightCorrection;
     g_lastLeftCmd =
         clampInt16((int32_t)g_baseSpeed - g_lastCorrection, 0, PWM_MAX);
     g_lastRightCmd =
@@ -816,6 +826,43 @@ static void step7_driveLinePid(const line_position_t *line)
 {
     g_lastCorrection = linePid_calculate(line->error);
     step7_driveWithLastLineCorrection();
+}
+
+static uint8_t imuDriveStraight(void)
+{
+    const mpu6050_straight_state_t *mpu;
+    int32_t combinedCorrection;
+
+    g_lastStraightCorrection = step7_gapStraightCorrection();
+    g_lastImuCorrection = mpu6050_straight_update(LINE_PID_PERIOD_MS);
+    mpu = mpu6050_straight_state();
+
+    if (mpu->ready == 0U) {
+        g_lastLeftCmd = 0;
+        g_lastRightCmd = 0;
+        g_driveMode = DRIVE_BRAKE;
+        motorBrake();
+        UART0_writeString("\r\n[IMU] read failed; braking\r\n");
+        return 1U;
+    }
+
+    /*
+     * Bench check: yawRate100 > 0 means the car nose is turning left.
+     * Encoder correction uses the F-mode sign; IMU correction has the opposite
+     * drive sign, so subtract it before applying the usual straight formula.
+     */
+    combinedCorrection =
+        (int32_t)g_lastStraightCorrection - (int32_t)g_lastImuCorrection;
+    g_lastCorrection = clampInt16(combinedCorrection,
+                                  -STEP7_GAP_BALANCE_MAX,
+                                  STEP7_GAP_BALANCE_MAX);
+    g_lastLeftCmd =
+        clampInt16((int32_t)g_baseSpeed - g_lastCorrection, 0, PWM_MAX);
+    g_lastRightCmd =
+        clampInt16((int32_t)g_baseSpeed + g_lastCorrection, 0, PWM_MAX);
+    driveSetLogical(g_lastLeftCmd, g_lastRightCmd);
+
+    return 0U;
 }
 
 static uint8_t step7_gapToBlackUpdate(const line_position_t *line)
@@ -1095,7 +1142,15 @@ static void abcd_update(const line_position_t *line)
 
 static void step6_lineFollowUpdate(void)
 {
-    line_position_t line = lineSensor_readPosition();
+    line_position_t line;
+
+    if (g_driveMode == DRIVE_IMU_STRAIGHT) {
+        (void)imuDriveStraight();
+        g_lastOdomTicks = step7_getOdomTicks();
+        return;
+    }
+
+    line = lineSensor_readPosition();
 
     g_lastLineRaw    = line.raw;
     g_lastLineActive = line.activeCount;
@@ -1158,6 +1213,13 @@ static void step6_lineFollowUpdate(void)
         return;
     }
 
+    if (g_driveMode != DRIVE_RUN) {
+        motorStop();
+        linePid_reset();
+        g_lastOdomTicks = step7_getOdomTicks();
+        return;
+    }
+
     if (step7_checkLapStop() != 0U) {
         return;
     }
@@ -1204,7 +1266,8 @@ static void step6_lineFollowUpdate(void)
 static void UART0_printHelp(void)
 {
     UART0_writeString(
-        "Commands: A=ABCD auto  g=Step7 lap  G=line  F=arm white->black  f=fwd jog  v=rev jog  x=coast  b=brake  "
+        "Commands: A=ABCD auto  g=Step7 lap  G=line  F=arm white->black  I=IMU init  i=IMU sample  Y=IMU straight  "
+        "f=fwd jog  v=rev jog  x=coast  b=brake  "
         "+/-=base  p/P=Kp  d/D=Kd\r\n");
     UART0_writeString(
         "Orient: w=swap motors  1=inv PWMA  2=inv PWMB  s=flip sensor  "
@@ -1256,8 +1319,124 @@ static void step6_stopForOrientationChange(void)
     linePid_reset();
 }
 
+static const char *imuInitResultName(mpu6050_straight_init_result_t result)
+{
+    switch (result) {
+        case MPU6050_STRAIGHT_INIT_OK:
+            return "OK";
+        case MPU6050_STRAIGHT_INIT_CAL_FAILED:
+            return "CAL_FAILED";
+        case MPU6050_STRAIGHT_INIT_NOT_FOUND:
+        default:
+            return "NOT_FOUND";
+    }
+}
+
+static void imuPrintState(void)
+{
+    const mpu6050_straight_state_t *mpu = mpu6050_straight_state();
+
+    UART0_writeString("[IMU] addr=");
+    UART0_writeDec32((int32_t)mpu->addr);
+    UART0_writeString(" who=");
+    UART0_writeDec32((int32_t)mpu->whoAmI);
+    UART0_writeString(" ready=");
+    UART0_writeDec32((int32_t)mpu->ready);
+    UART0_writeString(" fail=");
+    UART0_writeDec32((int32_t)mpu->readFailCount);
+    UART0_writeString(" biasZ=");
+    UART0_writeDec32(mpu->gyroZBiasRaw);
+    UART0_writeString(" rawZ=");
+    UART0_writeDec32(mpu->gyroZRaw);
+    UART0_writeString(" yawRate100=");
+    UART0_writeDec32(mpu->yawRateDps100);
+    UART0_writeString(" yaw100=");
+    UART0_writeDec32(mpu->yawDeg100);
+    UART0_writeString(" corr=");
+    UART0_writeDec32((int32_t)mpu->correction);
+    UART0_writeString("\r\n");
+}
+
+static void imuStopMotionForCheck(void)
+{
+    abcd_clearAutoRun();
+    step7_clearGapTest();
+    g_lapActive = 0U;
+    g_lapDone   = 0U;
+    g_driveMode = DRIVE_STANDBY;
+    motorStop();
+    linePid_reset();
+}
+
+static void imuRunStartupCheck(void)
+{
+    mpu6050_straight_init_result_t result;
+
+    imuStopMotionForCheck();
+    UART0_writeString("\r\n[IMU] keep car still; calibrating gyroZ for about 2 seconds...\r\n");
+    result = mpu6050_straight_startup_init();
+    UART0_writeString("[IMU] init=");
+    UART0_writeString(imuInitResultName(result));
+    UART0_writeString("\r\n");
+
+    if (result == MPU6050_STRAIGHT_INIT_OK) {
+        for (uint8_t i = 0U; i < 5U; i++) {
+            delay_ms(LINE_PID_PERIOD_MS);
+            (void)mpu6050_straight_update(LINE_PID_PERIOD_MS);
+        }
+    }
+
+    imuPrintState();
+}
+
+static void imuRunSampleCheck(void)
+{
+    const mpu6050_straight_state_t *mpu = mpu6050_straight_state();
+
+    imuStopMotionForCheck();
+    if (mpu->ready == 0U) {
+        UART0_writeString("\r\n[IMU] not ready; send uppercase I first\r\n");
+        imuPrintState();
+        return;
+    }
+
+    (void)mpu6050_straight_update(LINE_PID_PERIOD_MS);
+    UART0_writeString("\r\n");
+    imuPrintState();
+}
+
+static void imuStartStraightRun(void)
+{
+    const mpu6050_straight_state_t *mpu = mpu6050_straight_state();
+
+    abcd_clearAutoRun();
+    step7_clearGapTest();
+    g_lapActive = 0U;
+    g_lapDone   = 0U;
+    motorStop();
+    linePid_reset();
+
+    if (mpu->ready == 0U) {
+        g_driveMode = DRIVE_STANDBY;
+        UART0_writeString("\r\n[IMU] not ready; send uppercase I first\r\n");
+        imuPrintState();
+        return;
+    }
+
+    step7_resetOdom();
+    step7_gapResetStraightController();
+    mpu6050_straight_reset();
+    g_driveMode = DRIVE_IMU_STRAIGHT;
+    UART0_writeString("\r\n[IMU] straight test armed; send x to stop\r\n");
+    imuPrintState();
+}
+
 static void step6_handleCommand(uint8_t cmd)
 {
+    if ((cmd < 0x20U) || (cmd > 0x7EU)) {
+        return;
+    }
+
     switch (cmd) {
         case '\r':
         case '\n':
@@ -1289,6 +1468,16 @@ static void step6_handleCommand(uint8_t cmd)
             break;
         case 'F':
             step7_startGapToBlackRun();
+            break;
+        case 'I':
+            imuRunStartupCheck();
+            break;
+        case 'i':
+            imuRunSampleCheck();
+            break;
+        case 'Y':
+        case 'y':
+            imuStartStraightRun();
             break;
         case 'v':
         case 'V':
@@ -1446,12 +1635,15 @@ static void step6_printStatus(void)
 {
     int32_t encLeft;
     int32_t encRight;
+    const mpu6050_straight_state_t *mpu = mpu6050_straight_state();
 
     step6_readLogicalEncoders(&encLeft, &encRight);
     g_lastOdomTicks = step7_getOdomTicks();
 
     UART0_writeString("mode=");
     UART0_writeString(driveModeName(g_driveMode));
+    UART0_writeString(" modeId=");
+    UART0_writeDec32((int32_t)g_driveMode);
     UART0_writeString(" line=0b");
     UART0_writeBinary8(g_lastLineRaw);
     UART0_writeString(" st=");
@@ -1462,6 +1654,10 @@ static void step6_printStatus(void)
     UART0_writeDec32(g_lastLineError);
     UART0_writeString(" corr=");
     UART0_writeDec32(g_lastCorrection);
+    UART0_writeString(" encCorr=");
+    UART0_writeDec32(g_lastStraightCorrection);
+    UART0_writeString(" imuCorr=");
+    UART0_writeDec32(g_lastImuCorrection);
     UART0_writeString(" base=");
     UART0_writeDec32(g_baseSpeed);
     UART0_writeString(" L=");
@@ -1500,6 +1696,12 @@ static void step6_printStatus(void)
     UART0_writeDec32(g_gapLastDeltaRight);
     UART0_writeString(" gapBias=");
     UART0_writeDec32(g_gapBalanceBias);
+    UART0_writeString(" imuReady=");
+    UART0_writeDec32((int32_t)mpu->ready);
+    UART0_writeString(" imuRate=");
+    UART0_writeDec32(mpu->yawRateDps100);
+    UART0_writeString(" imuYaw=");
+    UART0_writeDec32(mpu->yawDeg100);
     UART0_writeString(" auto=");
     UART0_writeString(abcdStateName(g_abcdState));
     UART0_writeString(" autoOdom=");
@@ -1586,6 +1788,13 @@ void UART_0_INST_IRQHandler(void)
     switch (DL_UART_Main_getPendingInterrupt(UART_0_INST)) {
         case DL_UART_MAIN_IIDX_RX: {
             uint8_t data = (uint8_t)DL_UART_Main_readData(UART_0_INST);
+            if ((data == '\r') || (data == '\n')) {
+                UART0_writeByte(data);
+                break;
+            }
+            if ((data < 0x20U) || (data > 0x7EU)) {
+                break;
+            }
             g_uartCommand = data;
             UART0_writeByte(data);
             break;

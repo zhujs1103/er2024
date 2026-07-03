@@ -13,6 +13,7 @@
  * - Motor STBY: PB20 (active high)
  * - Encoder L: A PB17 (interrupt), B PB18 (input only)
  * - Encoder R: A PB24 (interrupt), B PB25 (input only)
+ * - MPU6050 test software I2C: SCL PB2, SDA PB3
  */
 //@cliArgs --device "MSPM0G350X" --package "LQFP-64(PM)" --part "Default"
 //@v2CliArgs --device "MSPM0G3507" --package "LQFP-64(PM)"

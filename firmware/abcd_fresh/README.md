@@ -60,11 +60,11 @@ GY-521 AD0 -> open or GND
 Test sequence:
 
 1. Keep the wheels off the ground or leave motor power disconnected.
-2. Flash this project and open UART0 at 9600-8N1.
+2. Flash this project and open UART0 at 115200-8N1.
 3. Confirm the startup line includes:
 
 ```text
-Build: 2026-07-03-abcd-fresh-y-enc-imu
+Build: 2026-07-04-abcd-fresh-cd-yaw-153
 ```
 
 4. Send uppercase `I`. Keep the car still for about 2 seconds.
@@ -74,24 +74,61 @@ Build: 2026-07-03-abcd-fresh-y-enc-imu
    `rawZ` should change sign between left and right rotation.
 
 `Y` is the first motion test for the straight controller with IMU correction.
-It reuses the proven F-mode encoder balancing with `gapBias=15`, then adds the
-measured gyroZ correction. It is still isolated from `F`, `G`, and `A`.
+It reuses the proven F-mode encoder balancing with `gapBias=15`, then adds
+gyroZ rate and a small yaw-angle correction. It is still isolated from `F`,
+`G`, and `A`.
 
 ## ABCD State Machine
 
 The auto mode deliberately keeps the logic small:
 
-1. `AB_STRAIGHT`: use the old `F` white-to-black straight behavior.
-2. `B_GUARD`: keep driving straight for a short encoder guard distance.
-3. `B_ACQUIRE`: keep straight until the center sensor group sees the black line.
-4. `BC_LINE`: use the old `G` line PID on the arc.
-5. `CD_STRAIGHT`: use the old `F` straight behavior again.
-6. `D_GUARD`: same transition guard as `B_GUARD`.
-7. `D_ACQUIRE`: same center acquisition as `B_ACQUIRE`.
-8. `DA_LINE`: use the old `G` line PID and stop after confirmed line loss.
+1. `AB_STRAIGHT`: wait for all-white, then run the `Y`-style IMU straight
+   controller toward yaw `0 deg` until the B black line is detected in the
+   measured encoder window.
+2. `B_GUARD`: keep yaw `0 deg` for an extremely short encoder protection
+   distance. After about `15 ticks`, enter `BC_LINE` as soon as the center
+   sensor group sees the black line. By about `45 ticks`, enter `BC_LINE` if
+   any black line is still visible; if the line is already lost, brake with
+   `entry lost black`.
+3. `BC_LINE`: use the old `G` line PID on the arc while integrating an
+   unclamped auto yaw estimate. After the minimum arc odometer window,
+   confirmed all-white means C exit; yaw is telemetry and heading context, not
+   the C-exit gate.
+4. `C_ALIGN`: immediately leave the arc PID, keep the measured C-exit yaw as
+   telemetry context, and actively align toward the fixed CD heading target.
+5. `CD_STRAIGHT`: run the `Y`-style IMU straight controller toward the fixed CD
+   heading target until the D black line is detected.
+6. `D_GUARD`: same short transition protection as `B_GUARD`, holding the fixed
+   CD heading target.
+7. `DA_LINE`: use the old `G` line PID. After the minimum arc distance,
+   confirmed all-white means the final arc exit; yaw is telemetry and heading
+   context, not the only stop gate.
 
-The guard/acquire split prevents the first edge sensor hit from being fed
-directly into line PID.
+The short guard prevents the first edge sensor hit from being fed directly into
+line PID, but it is bounded to roughly a few centimetres so the car cannot keep
+driving straight across B or D. `A` requires a successful uppercase `I`
+calibration first; it does not share the `F` mode's gap-test state variables.
+At arc exit, the firmware holds the last visible-line yaw during the short
+all-white confirmation window so the car does not keep applying the final large
+arc PID correction after leaving the black line. The line/PID control period is
+back at the 20 ms baseline, while automatic-mode status output stays compact to
+avoid long blocking UART prints while the car is following the arc. Each straight
+segment resets its own encoder-balance baseline, so the BC/DA arc's accumulated
+left-right encoder difference is not carried into the following straight. After
+C exit is confirmed by the line sensors, `C_ALIGN`, `CD_STRAIGHT`, and `D_GUARD`
+now target `ABCD_YAW_TARGET_CD_DEG100` instead of the raw C-exit yaw. The current
+field-tuned value is `-15300` after `-15500` repeatedly looked slightly right of
+D.
+The Keil startup stack is increased to 2 KB; the latest static call graph reports a
+maximum known stack depth around 392 bytes, so this is mainly a safety margin.
+
+Latest field result for `2026-07-04-abcd-fresh-cd-yaw-153`: multiple A-mode
+runs completed the full ABCDA loop. One deliberately imperfect start reached B
+normally but failed near D with `entry lost black` at `yaw=-15395` and
+`t=-15300`, which suggests the CD heading target is close and the remaining weak
+point is the shared short B/D entry guard being stricter than D sometimes needs.
+Do not retune the CD yaw target only from that failure; widen or reuse
+`D_ACQUIRE` first if D entry remains flaky.
 
 ## First Test Order
 
@@ -99,15 +136,23 @@ directly into line PID.
 2. Confirm the startup line includes:
 
 ```text
-Build: 2026-07-03-abcd-fresh-y-enc-imu
+Build: 2026-07-04-abcd-fresh-cd-yaw-153
 ```
 
 3. Test `I` / `i` if the MPU6050 is connected.
 4. Test `Y` on a clear white floor, with one hand ready to send `x`.
 5. Test `F`.
 6. Test `G`.
-7. Only then test `A`.
+7. Only then test `A`: keep the car still, send uppercase `I`, place the car at
+   A with its front pointing to B, put the sensor slightly into the AB white
+   area, then send `A`.
 
-While testing `A`, watch `auto=... autoOdom=... autoCenter=... point=...` in
-telemetry. The useful failure points are usually `B_GUARD`, `B_ACQUIRE`,
-`D_GUARD`, or `D_ACQUIRE`.
+While testing `A`, watch this compact line in telemetry:
+`A s=... od=... ln=... st=... n=... e=... c=... ec=... ic=... L=... R=... enc=... y=... h=... t=... lost=... p=...`
+`ec` is the encoder straight correction, `ic` is the IMU/yaw correction, `h` is
+the last visible C/arc-exit yaw, and `t` is the active yaw target.
+The useful failure reasons are `white missed black`,
+`center not acquired`, `arc lost early`, `arc exit missed`, `align timeout`,
+`entry lost black`, and `imu lost`. If only D reports `entry lost black` while
+CD yaw is near `-15300`, treat it as a D entry/acquire robustness issue before
+changing the CD heading target.

@@ -49,7 +49,7 @@
  *   Logical left/right wheel PWM are transformed through orientation flags,
  *   so chassis front/left mistakes can be fixed without rewiring.
  *
- * Serial output @ 9600-8N1:
+ * Serial output @ 115200-8N1:
  *   mode=RUN line=0bXXXXXXXX st=OK err=%d corr=%d base=%d L=%d R=%d encL=%d encR=%d odom=%d
  */
 
@@ -64,7 +64,8 @@
 
 /* ---- timing ---- */
 #define STATUS_PRINT_PERIOD_MS    (200U)
-#define LINE_PID_PERIOD_MS        (20U)    /* 50 Hz first floor-test loop */
+#define AUTO_STATUS_PRINT_PERIOD_MS (500U)
+#define LINE_PID_PERIOD_MS        (20U)    /* 50 Hz line/PID control loop */
 #define LED_TOGGLE_PERIOD_MS      (500U)
 #define LAP_DONE_LED_PERIOD_MS    (100U)
 #define LINE_SENSOR_SETTLE_US     (50U)
@@ -99,15 +100,28 @@
 #define STEP7_GAP_BALANCE_BIAS_STEP    (5)
 #define STEP7_GAP_BLACK_CONFIRM_TICKS  (3U)
 
-#define ER2024_FW_BUILD_TAG "2026-07-03-abcd-fresh-y-enc-imu"
+#define ER2024_FW_BUILD_TAG "2026-07-04-abcd-fresh-cd-yaw-153"
 
-#define ABCD_ENTRY_GUARD_TICKS      (160)
-#define ABCD_ACQUIRE_MAX_TICKS      (900)
-#define ABCD_CENTER_CONFIRM_TICKS   (2U)
-#define ABCD_CENTER_MASK            ((uint8_t)0x3CU)
-#define ABCD_ARC_ENTRY_GRACE_TICKS  (120)
-#define ABCD_ARC_EXIT_MIN_TICKS     (1200)
-#define ABCD_ARC_LOST_CONFIRM_TICKS (3U)
+#define ABCD_WHITE_BLACK_MIN_TICKS     (1200)
+#define ABCD_WHITE_BLACK_MAX_TICKS     (1900)
+#define ABCD_WHITE_BLACK_CONFIRM_TICKS (1U)
+#define ABCD_ENTRY_PROTECT_MIN_TICKS   (15)
+#define ABCD_ENTRY_PROTECT_MAX_TICKS   (45)
+#define ABCD_ACQUIRE_MAX_TICKS         (45)
+#define ABCD_CENTER_CONFIRM_TICKS      (2U)
+#define ABCD_CENTER_MASK               ((uint8_t)0x3CU)
+#define ABCD_ARC_ENTRY_GRACE_TICKS     (120)
+#define ABCD_ARC_EXIT_MIN_TICKS        (1500)
+#define ABCD_ARC_EXIT_MAX_TICKS        (2600)
+#define ABCD_ARC_LOST_CONFIRM_TICKS    (3U)
+#define ABCD_ARC_YAW_TOL_DEG100        (1000L)
+#define ABCD_ALIGN_YAW_TOL_DEG100      (500L)
+#define ABCD_ALIGN_CONFIRM_TICKS       (2U)
+#define ABCD_ALIGN_MAX_TICKS           (250)
+#define ABCD_AUTO_YAW_LIMIT_DEG100     (45000L)
+#define ABCD_YAW_TARGET_AB_DEG100      (0L)
+#define ABCD_YAW_TARGET_CD_DEG100      (-15300L)
+#define ABCD_YAW_TARGET_DONE_DEG100    (-36000L)
 
 /*
  * Confirmed 2026-07-01:
@@ -161,6 +175,7 @@ typedef enum {
     ABCD_STATE_B_GUARD,
     ABCD_STATE_B_ACQUIRE,
     ABCD_STATE_BC_LINE,
+    ABCD_STATE_C_ALIGN,
     ABCD_STATE_CD_STRAIGHT,
     ABCD_STATE_D_GUARD,
     ABCD_STATE_D_ACQUIRE,
@@ -210,6 +225,8 @@ static uint8_t       g_lapDone        = 0U;
 static uint8_t       g_gapStopRaw     = 0U;
 static uint8_t       g_gapBlackTicks  = 0U;
 static int16_t       g_gapBalanceBias = STEP7_GAP_BALANCE_BIAS_DEFAULT;
+static int32_t       g_gapStartLeftTicks = 0;
+static int32_t       g_gapStartRightTicks = 0;
 static int32_t       g_gapPrevLeftTicks  = 0;
 static int32_t       g_gapPrevRightTicks = 0;
 static int32_t       g_gapLastDeltaLeft  = 0;
@@ -221,6 +238,13 @@ static int32_t       g_abcdStateOdomTicks = 0;
 static uint8_t       g_abcdLostTicks = 0U;
 static uint8_t       g_abcdCenterTicks = 0U;
 static uint8_t       g_abcdPointCount = 0U;
+static uint8_t       g_abcdBlackTicks = 0U;
+static uint8_t       g_abcdYawTicks = 0U;
+static uint8_t       g_abcdWhiteReady = 0U;
+static int32_t       g_abcdYawDeg100 = 0;
+static int32_t       g_abcdYawTargetDeg100 = 0;
+static int32_t       g_abcdYawErrorDeg100 = 0;
+static int32_t       g_abcdHoldYawDeg100 = 0;
 
 static uint8_t g_motorSwapSides   = STEP6_SWAP_MOTOR_SIDES_DEFAULT;
 static uint8_t g_motorInvertA     = STEP6_INVERT_MOTOR_A_DEFAULT;
@@ -233,7 +257,9 @@ static uint8_t g_encoderInvertB   = STEP6_INVERT_ENCODER_B_DEFAULT;
 static void linePid_reset(void);
 static int16_t clampInt16(int32_t value, int16_t minVal, int16_t maxVal);
 static void abcd_clearAutoRun(void);
+static void abcd_brake(abcd_state_t state, const char *reason);
 static void abcd_startAutoRun(void);
+static void imuPrintState(void);
 
 static uint16_t motorPwmCompareFromSpeed(int16_t speed)
 {
@@ -368,6 +394,8 @@ static const char *abcdStateName(abcd_state_t state)
             return "B_ACQUIRE";
         case ABCD_STATE_BC_LINE:
             return "BC_LINE";
+        case ABCD_STATE_C_ALIGN:
+            return "C_ALIGN";
         case ABCD_STATE_CD_STRAIGHT:
             return "CD_STRAIGHT";
         case ABCD_STATE_D_GUARD:
@@ -597,6 +625,8 @@ static int16_t step7_gapStraightCorrection(void)
     int32_t correction;
     int32_t deltaLeft;
     int32_t deltaRight;
+    int32_t relLeft;
+    int32_t relRight;
 
     step6_readLogicalEncoders(&left, &right);
 
@@ -621,7 +651,16 @@ static int16_t step7_gapStraightCorrection(void)
     g_gapLastDeltaLeft = deltaLeft;
     g_gapLastDeltaRight = deltaRight;
 
-    positionError = left - right;
+    relLeft = left - g_gapStartLeftTicks;
+    relRight = right - g_gapStartRightTicks;
+    if (relLeft < 0) {
+        relLeft = 0;
+    }
+    if (relRight < 0) {
+        relRight = 0;
+    }
+
+    positionError = relLeft - relRight;
     speedError = deltaLeft - deltaRight;
 
     correction = (positionError * STEP7_GAP_BALANCE_POS_KP_NUM) /
@@ -650,6 +689,8 @@ static void step7_gapResetStraightController(void)
         right = 0;
     }
 
+    g_gapStartLeftTicks = left;
+    g_gapStartRightTicks = right;
     g_gapPrevLeftTicks = left;
     g_gapPrevRightTicks = right;
     g_gapLastDeltaLeft = 0;
@@ -682,6 +723,13 @@ static void abcd_clearAutoRun(void)
     g_abcdLostTicks = 0U;
     g_abcdCenterTicks = 0U;
     g_abcdPointCount = 0U;
+    g_abcdBlackTicks = 0U;
+    g_abcdYawTicks = 0U;
+    g_abcdWhiteReady = 0U;
+    g_abcdYawDeg100 = 0;
+    g_abcdYawTargetDeg100 = 0;
+    g_abcdYawErrorDeg100 = 0;
+    g_abcdHoldYawDeg100 = 0;
 }
 
 static void step7_printLapParams(void)
@@ -931,7 +979,98 @@ static void abcd_printEvent(const char *event)
     UART0_writeDec32(g_abcdStateOdomTicks);
     UART0_writeString(" point=");
     UART0_writeDec32(g_abcdPointCount);
+    UART0_writeString(" yaw=");
+    UART0_writeDec32(g_abcdYawDeg100);
+    UART0_writeString(" tgt=");
+    UART0_writeDec32(g_abcdYawTargetDeg100);
+    UART0_writeString(" err=");
+    UART0_writeDec32(g_abcdYawErrorDeg100);
+    UART0_writeString(" hold=");
+    UART0_writeDec32(g_abcdHoldYawDeg100);
     UART0_writeString("\r\n");
+}
+
+static int32_t abcd_abs32(int32_t value)
+{
+    return (value < 0) ? -value : value;
+}
+
+static int32_t abcd_clampInt32(int32_t value, int32_t minVal, int32_t maxVal)
+{
+    if (value < minVal) {
+        return minVal;
+    }
+    if (value > maxVal) {
+        return maxVal;
+    }
+    return value;
+}
+
+static void abcd_setYawTarget(int32_t targetDeg100)
+{
+    g_abcdYawTargetDeg100 = targetDeg100;
+    g_abcdYawErrorDeg100 = g_abcdYawDeg100 - g_abcdYawTargetDeg100;
+}
+
+static uint8_t abcd_updateYaw(void)
+{
+    const mpu6050_straight_state_t *mpu;
+
+    (void)mpu6050_straight_update(LINE_PID_PERIOD_MS);
+    mpu = mpu6050_straight_state();
+
+    if (mpu->ready == 0U) {
+        g_abcdYawErrorDeg100 = g_abcdYawDeg100 - g_abcdYawTargetDeg100;
+        return 0U;
+    }
+
+    g_abcdYawDeg100 +=
+        (mpu->yawRateDps100 * (int32_t)LINE_PID_PERIOD_MS) / 1000L;
+    g_abcdYawDeg100 = abcd_clampInt32(g_abcdYawDeg100,
+                                      -ABCD_AUTO_YAW_LIMIT_DEG100,
+                                      ABCD_AUTO_YAW_LIMIT_DEG100);
+    g_abcdYawErrorDeg100 = g_abcdYawDeg100 - g_abcdYawTargetDeg100;
+
+    return 1U;
+}
+
+static uint8_t abcd_yawWithin(int32_t targetDeg100, int32_t toleranceDeg100)
+{
+    abcd_setYawTarget(targetDeg100);
+    return (abcd_abs32(g_abcdYawErrorDeg100) <= toleranceDeg100) ? 1U : 0U;
+}
+
+static void abcd_applyYawStraightFromCurrentYaw(int32_t targetDeg100)
+{
+    int32_t combinedCorrection;
+
+    abcd_setYawTarget(targetDeg100);
+    g_lastStraightCorrection = step7_gapStraightCorrection();
+    g_lastImuCorrection =
+        mpu6050_straight_correction_from_error(g_abcdYawErrorDeg100);
+    combinedCorrection =
+        (int32_t)g_lastStraightCorrection - (int32_t)g_lastImuCorrection;
+
+    g_lastCorrection = clampInt16(combinedCorrection,
+                                  -STEP7_GAP_BALANCE_MAX,
+                                  STEP7_GAP_BALANCE_MAX);
+    g_lastLeftCmd =
+        clampInt16((int32_t)g_baseSpeed - g_lastCorrection, 0, PWM_MAX);
+    g_lastRightCmd =
+        clampInt16((int32_t)g_baseSpeed + g_lastCorrection, 0, PWM_MAX);
+    driveSetLogical(g_lastLeftCmd, g_lastRightCmd);
+}
+
+static uint8_t abcd_driveYawStraight(int32_t targetDeg100)
+{
+    abcd_setYawTarget(targetDeg100);
+    if (abcd_updateYaw() == 0U) {
+        abcd_brake(ABCD_STATE_FAIL, "imu lost");
+        return 1U;
+    }
+
+    abcd_applyYawStraightFromCurrentYaw(targetDeg100);
+    return 0U;
 }
 
 static void abcd_enterState(abcd_state_t state)
@@ -941,21 +1080,44 @@ static void abcd_enterState(abcd_state_t state)
     g_abcdStateOdomTicks = 0;
     g_abcdLostTicks = 0U;
     g_abcdCenterTicks = 0U;
+    g_abcdBlackTicks = 0U;
+    g_abcdYawTicks = 0U;
     g_lineLostTicks = 0U;
+    g_gapTestState = GAP_TEST_OFF;
+    g_gapStopOdomTicks = 0;
+    g_gapStopRaw = 0U;
+    g_gapBlackTicks = 0U;
 
-    if ((state == ABCD_STATE_AB_STRAIGHT) ||
-        (state == ABCD_STATE_CD_STRAIGHT)) {
-        g_gapTestState = GAP_TEST_WAIT_WHITE;
-        g_gapStopOdomTicks = 0;
-        g_gapStopRaw = 0U;
-        g_gapBlackTicks = 0U;
-        step7_gapResetStraightController();
-    } else {
-        g_gapTestState = GAP_TEST_OFF;
+    switch (state) {
+        case ABCD_STATE_AB_STRAIGHT:
+        case ABCD_STATE_B_GUARD:
+        case ABCD_STATE_B_ACQUIRE:
+            abcd_setYawTarget(ABCD_YAW_TARGET_AB_DEG100);
+            break;
+        case ABCD_STATE_BC_LINE:
+            abcd_setYawTarget(ABCD_YAW_TARGET_CD_DEG100);
+            g_abcdHoldYawDeg100 = g_abcdYawDeg100;
+            break;
+        case ABCD_STATE_C_ALIGN:
+        case ABCD_STATE_CD_STRAIGHT:
+        case ABCD_STATE_D_GUARD:
+        case ABCD_STATE_D_ACQUIRE:
+            abcd_setYawTarget(ABCD_YAW_TARGET_CD_DEG100);
+            break;
+        case ABCD_STATE_DA_LINE:
+        case ABCD_STATE_DONE:
+            abcd_setYawTarget(ABCD_YAW_TARGET_DONE_DEG100);
+            g_abcdHoldYawDeg100 = g_abcdYawDeg100;
+            break;
+        case ABCD_STATE_FAIL:
+        case ABCD_STATE_OFF:
+        default:
+            break;
     }
 
+    g_abcdWhiteReady = (state == ABCD_STATE_AB_STRAIGHT) ? 0U : 1U;
+    step7_gapResetStraightController();
     linePid_reset();
-    abcd_printEvent("enter");
 }
 
 static void abcd_brake(abcd_state_t state, const char *reason)
@@ -969,6 +1131,7 @@ static void abcd_brake(abcd_state_t state, const char *reason)
     g_lastRightCmd = 0;
     motorBrake();
     linePid_reset();
+    g_gapTestState = GAP_TEST_OFF;
 
     UART0_writeString("\r\n[AUTO] ");
     UART0_writeString(reason);
@@ -976,18 +1139,105 @@ static void abcd_brake(abcd_state_t state, const char *reason)
     UART0_writeString(abcdStateName(g_abcdState));
     UART0_writeString(" odom=");
     UART0_writeDec32(g_lastOdomTicks);
+    UART0_writeString(" stateOdom=");
+    UART0_writeDec32(g_abcdStateOdomTicks);
+    UART0_writeString(" yaw=");
+    UART0_writeDec32(g_abcdYawDeg100);
+    UART0_writeString(" tgt=");
+    UART0_writeDec32(g_abcdYawTargetDeg100);
+    UART0_writeString(" err=");
+    UART0_writeDec32(g_abcdYawErrorDeg100);
+    UART0_writeString(" hold=");
+    UART0_writeDec32(g_abcdHoldYawDeg100);
     UART0_writeString("\r\n");
 }
 
 static uint8_t abcd_lineNearCenter(const line_position_t *line)
 {
-    if (line->status != LINE_STATUS_OK) {
+    if (line->status == LINE_STATUS_LOST) {
         return 0U;
+    }
+    if (line->status == LINE_STATUS_ALL_BLACK) {
+        return 1U;
     }
     return ((line->raw & ABCD_CENTER_MASK) != 0U) ? 1U : 0U;
 }
 
+static uint8_t abcd_updateWhiteStraight(const line_position_t *line,
+                                        int32_t yawTargetDeg100,
+                                        abcd_state_t nextState)
+{
+    if (g_abcdWhiteReady == 0U) {
+        g_lastLeftCmd = 0;
+        g_lastRightCmd = 0;
+        motorStop();
+
+        if (line->activeCount == 0U) {
+            g_abcdWhiteReady = 1U;
+            g_abcdStateStartOdomTicks = step7_getOdomTicks();
+            g_abcdStateOdomTicks = 0;
+            g_abcdBlackTicks = 0U;
+            step7_gapResetStraightController();
+            abcd_setYawTarget(yawTargetDeg100);
+        }
+        return 0U;
+    }
+
+    if ((g_abcdStateOdomTicks >= ABCD_WHITE_BLACK_MIN_TICKS) &&
+        (line->activeCount > 0U)) {
+        if (g_abcdBlackTicks < ABCD_WHITE_BLACK_CONFIRM_TICKS) {
+            g_abcdBlackTicks++;
+        }
+    } else {
+        g_abcdBlackTicks = 0U;
+    }
+
+    if (g_abcdBlackTicks >= ABCD_WHITE_BLACK_CONFIRM_TICKS) {
+        abcd_enterState(nextState);
+        if (abcd_driveYawStraight(yawTargetDeg100) != 0U) {
+            return 0U;
+        }
+        return 1U;
+    }
+
+    if (g_abcdStateOdomTicks > ABCD_WHITE_BLACK_MAX_TICKS) {
+        abcd_brake(ABCD_STATE_FAIL, "white missed black");
+        return 0U;
+    }
+
+    (void)abcd_driveYawStraight(yawTargetDeg100);
+    return 0U;
+}
+
+static uint8_t abcd_updateGuard(const line_position_t *line,
+                                int32_t yawTargetDeg100,
+                                abcd_state_t nextState)
+{
+    if (g_abcdStateOdomTicks < ABCD_ENTRY_PROTECT_MIN_TICKS) {
+        return abcd_driveYawStraight(yawTargetDeg100);
+    }
+
+    if (abcd_lineNearCenter(line) != 0U) {
+        abcd_enterState(nextState);
+        step7_driveLinePid(line);
+        return 1U;
+    }
+
+    if (g_abcdStateOdomTicks >= ABCD_ENTRY_PROTECT_MAX_TICKS) {
+        if (line->activeCount > 0U) {
+            abcd_enterState(nextState);
+            step7_driveLinePid(line);
+            return 1U;
+        }
+        abcd_brake(ABCD_STATE_FAIL, "entry lost black");
+        return 1U;
+    }
+
+    return abcd_driveYawStraight(yawTargetDeg100);
+}
+
 static uint8_t abcd_updateAcquire(const line_position_t *line,
+                                  int32_t yawTargetDeg100,
                                   abcd_state_t nextState)
 {
     if (abcd_lineNearCenter(line) != 0U) {
@@ -1009,12 +1259,20 @@ static uint8_t abcd_updateAcquire(const line_position_t *line,
         return 1U;
     }
 
-    step7_gapDriveStraight();
-    return 0U;
+    return abcd_driveYawStraight(yawTargetDeg100);
 }
 
-static uint8_t abcd_updateArcLine(const line_position_t *line)
+static uint8_t abcd_updateArcLine(const line_position_t *line,
+                                  int32_t exitYawTargetDeg100)
 {
+    abcd_setYawTarget(exitYawTargetDeg100);
+    if (abcd_updateYaw() == 0U) {
+        abcd_brake(ABCD_STATE_FAIL, "imu lost");
+        return 0U;
+    }
+    g_lastImuCorrection =
+        mpu6050_straight_correction_from_error(g_abcdYawErrorDeg100);
+
     if (line->status == LINE_STATUS_LOST) {
         if (g_abcdStateOdomTicks < ABCD_ARC_ENTRY_GRACE_TICKS) {
             g_abcdLostTicks = 0U;
@@ -1029,42 +1287,95 @@ static uint8_t abcd_updateArcLine(const line_position_t *line)
             if (g_abcdLostTicks >= ABCD_ARC_LOST_CONFIRM_TICKS) {
                 return 1U;
             }
-        } else if (g_lineLostTicks < STEP7_LOST_GRACE_TICKS) {
-            g_lineLostTicks++;
-        } else {
-            abcd_brake(ABCD_STATE_FAIL, "arc lost early");
+            abcd_applyYawStraightFromCurrentYaw(g_abcdHoldYawDeg100);
             return 0U;
         }
 
-        step7_driveWithLastLineCorrection();
+        if (g_lineLostTicks < STEP7_LOST_GRACE_TICKS) {
+            g_lineLostTicks++;
+            step7_driveWithLastLineCorrection();
+            return 0U;
+        }
+
+        abcd_brake(ABCD_STATE_FAIL, "arc lost early");
         return 0U;
     }
 
     g_abcdLostTicks = 0U;
+    g_abcdYawTicks = 0U;
     g_lineLostTicks = 0U;
+
+    if (g_abcdStateOdomTicks > ABCD_ARC_EXIT_MAX_TICKS) {
+        abcd_brake(ABCD_STATE_FAIL, "arc exit missed");
+        return 0U;
+    }
 
     if (line->status == LINE_STATUS_ALL_BLACK) {
         step7_driveLinePid(line);
         return 0U;
     }
 
+    g_abcdHoldYawDeg100 = g_abcdYawDeg100;
     step7_driveLinePid(line);
+    return 0U;
+}
+
+static uint8_t abcd_updateAlign(int32_t yawTargetDeg100,
+                                abcd_state_t nextState)
+{
+    if (abcd_driveYawStraight(yawTargetDeg100) != 0U) {
+        return 1U;
+    }
+
+    if (abcd_yawWithin(yawTargetDeg100, ABCD_ALIGN_YAW_TOL_DEG100) != 0U) {
+        if (g_abcdYawTicks < ABCD_ALIGN_CONFIRM_TICKS) {
+            g_abcdYawTicks++;
+        }
+    } else {
+        g_abcdYawTicks = 0U;
+    }
+
+    if (g_abcdYawTicks >= ABCD_ALIGN_CONFIRM_TICKS) {
+        abcd_enterState(nextState);
+        return 1U;
+    }
+
+    if (g_abcdStateOdomTicks > ABCD_ALIGN_MAX_TICKS) {
+        abcd_brake(ABCD_STATE_FAIL, "align timeout");
+        return 1U;
+    }
+
     return 0U;
 }
 
 static void abcd_startAutoRun(void)
 {
+    const mpu6050_straight_state_t *mpu = mpu6050_straight_state();
+
     step7_clearGapTest();
-    step7_resetOdom();
-    step7_gapResetStraightController();
     g_lapActive = 0U;
     g_lapDone = 0U;
-    g_driveMode = DRIVE_AUTO;
+    motorStop();
     abcd_clearAutoRun();
     linePid_reset();
 
-    UART0_writeString("\r\n[AUTO] ABCD fresh run armed\r\n");
+    if (mpu->ready == 0U) {
+        g_driveMode = DRIVE_STANDBY;
+        UART0_writeString("\r\n[AUTO] IMU not ready; send uppercase I first\r\n");
+        imuPrintState();
+        return;
+    }
+
+    step7_resetOdom();
+    step7_gapResetStraightController();
+    mpu6050_straight_reset();
+    g_abcdYawDeg100 = ABCD_YAW_TARGET_AB_DEG100;
+    abcd_setYawTarget(ABCD_YAW_TARGET_AB_DEG100);
+    g_driveMode = DRIVE_AUTO;
+
+    UART0_writeString("\r\n[AUTO] ABCD fresh run armed; IMU yaw targets enabled\r\n");
     abcd_enterState(ABCD_STATE_AB_STRAIGHT);
+    abcd_printEvent("start");
 }
 
 static void abcd_update(const line_position_t *line)
@@ -1077,53 +1388,62 @@ static void abcd_update(const line_position_t *line)
 
     switch (g_abcdState) {
         case ABCD_STATE_AB_STRAIGHT:
-            if (step7_gapToBlackUpdate(line) != 0U) {
+            if (abcd_updateWhiteStraight(line,
+                                         ABCD_YAW_TARGET_AB_DEG100,
+                                         ABCD_STATE_B_GUARD) != 0U) {
                 g_abcdPointCount = 1U;
-                abcd_enterState(ABCD_STATE_B_GUARD);
             }
             break;
 
         case ABCD_STATE_B_GUARD:
-            if (g_abcdStateOdomTicks >= ABCD_ENTRY_GUARD_TICKS) {
-                abcd_enterState(ABCD_STATE_B_ACQUIRE);
-            } else {
-                step7_gapDriveStraight();
-            }
+            (void)abcd_updateGuard(line,
+                                   ABCD_YAW_TARGET_AB_DEG100,
+                                   ABCD_STATE_BC_LINE);
             break;
 
         case ABCD_STATE_B_ACQUIRE:
-            (void)abcd_updateAcquire(line, ABCD_STATE_BC_LINE);
+            (void)abcd_updateAcquire(line,
+                                     ABCD_YAW_TARGET_AB_DEG100,
+                                     ABCD_STATE_BC_LINE);
             break;
 
         case ABCD_STATE_BC_LINE:
-            if (abcd_updateArcLine(line) != 0U) {
+            if (abcd_updateArcLine(line, ABCD_YAW_TARGET_CD_DEG100) != 0U) {
                 g_abcdPointCount = 2U;
-                abcd_enterState(ABCD_STATE_CD_STRAIGHT);
+                abcd_enterState(ABCD_STATE_C_ALIGN);
+                (void)abcd_driveYawStraight(ABCD_YAW_TARGET_CD_DEG100);
             }
             break;
 
+        case ABCD_STATE_C_ALIGN:
+            (void)abcd_updateAlign(ABCD_YAW_TARGET_CD_DEG100,
+                                   ABCD_STATE_CD_STRAIGHT);
+            break;
+
         case ABCD_STATE_CD_STRAIGHT:
-            if (step7_gapToBlackUpdate(line) != 0U) {
+            if (abcd_updateWhiteStraight(line,
+                                         ABCD_YAW_TARGET_CD_DEG100,
+                                         ABCD_STATE_D_GUARD) != 0U) {
                 g_abcdPointCount = 3U;
-                abcd_enterState(ABCD_STATE_D_GUARD);
             }
             break;
 
         case ABCD_STATE_D_GUARD:
-            if (g_abcdStateOdomTicks >= ABCD_ENTRY_GUARD_TICKS) {
-                abcd_enterState(ABCD_STATE_D_ACQUIRE);
-            } else {
-                step7_gapDriveStraight();
-            }
+            (void)abcd_updateGuard(line,
+                                   ABCD_YAW_TARGET_CD_DEG100,
+                                   ABCD_STATE_DA_LINE);
             break;
 
         case ABCD_STATE_D_ACQUIRE:
-            (void)abcd_updateAcquire(line, ABCD_STATE_DA_LINE);
+            (void)abcd_updateAcquire(line,
+                                     ABCD_YAW_TARGET_CD_DEG100,
+                                     ABCD_STATE_DA_LINE);
             break;
 
         case ABCD_STATE_DA_LINE:
-            if (abcd_updateArcLine(line) != 0U) {
+            if (abcd_updateArcLine(line, ABCD_YAW_TARGET_DONE_DEG100) != 0U) {
                 g_abcdPointCount = 4U;
+                abcd_setYawTarget(ABCD_YAW_TARGET_DONE_DEG100);
                 abcd_brake(ABCD_STATE_DONE, "done");
             }
             break;
@@ -1631,6 +1951,47 @@ static void step6_handleCommand(uint8_t cmd)
     }
 }
 
+static void abcd_printCompactStatus(int32_t encLeft, int32_t encRight)
+{
+    UART0_writeString("A s=");
+    UART0_writeString(abcdStateName(g_abcdState));
+    UART0_writeString(" od=");
+    UART0_writeDec32(g_abcdStateOdomTicks);
+    UART0_writeString(" ln=");
+    UART0_writeBinary8(g_lastLineRaw);
+    UART0_writeString(" st=");
+    UART0_writeString(lineStatusName(g_lastLineStatus));
+    UART0_writeString(" n=");
+    UART0_writeDec32(g_lastLineActive);
+    UART0_writeString(" e=");
+    UART0_writeDec32(g_lastLineError);
+    UART0_writeString(" c=");
+    UART0_writeDec32(g_lastCorrection);
+    UART0_writeString(" ec=");
+    UART0_writeDec32(g_lastStraightCorrection);
+    UART0_writeString(" ic=");
+    UART0_writeDec32(g_lastImuCorrection);
+    UART0_writeString(" L=");
+    UART0_writeDec32(g_lastLeftCmd);
+    UART0_writeString(" R=");
+    UART0_writeDec32(g_lastRightCmd);
+    UART0_writeString(" enc=");
+    UART0_writeDec32(encLeft);
+    UART0_writeByte('/');
+    UART0_writeDec32(encRight);
+    UART0_writeString(" y=");
+    UART0_writeDec32(g_abcdYawDeg100);
+    UART0_writeString(" h=");
+    UART0_writeDec32(g_abcdHoldYawDeg100);
+    UART0_writeString(" t=");
+    UART0_writeDec32(g_abcdYawTargetDeg100);
+    UART0_writeString(" lost=");
+    UART0_writeDec32(g_abcdLostTicks);
+    UART0_writeString(" p=");
+    UART0_writeDec32(g_abcdPointCount);
+    UART0_writeString("\r\n");
+}
+
 static void step6_printStatus(void)
 {
     int32_t encLeft;
@@ -1639,6 +2000,11 @@ static void step6_printStatus(void)
 
     step6_readLogicalEncoders(&encLeft, &encRight);
     g_lastOdomTicks = step7_getOdomTicks();
+
+    if (g_driveMode == DRIVE_AUTO) {
+        abcd_printCompactStatus(encLeft, encRight);
+        return;
+    }
 
     UART0_writeString("mode=");
     UART0_writeString(driveModeName(g_driveMode));
@@ -1706,10 +2072,24 @@ static void step6_printStatus(void)
     UART0_writeString(abcdStateName(g_abcdState));
     UART0_writeString(" autoOdom=");
     UART0_writeDec32(g_abcdStateOdomTicks);
+    UART0_writeString(" autoYaw=");
+    UART0_writeDec32(g_abcdYawDeg100);
+    UART0_writeString(" autoTgt=");
+    UART0_writeDec32(g_abcdYawTargetDeg100);
+    UART0_writeString(" autoErr=");
+    UART0_writeDec32(g_abcdYawErrorDeg100);
+    UART0_writeString(" autoHold=");
+    UART0_writeDec32(g_abcdHoldYawDeg100);
+    UART0_writeString(" autoBlk=");
+    UART0_writeDec32(g_abcdBlackTicks);
     UART0_writeString(" autoLost=");
     UART0_writeDec32(g_abcdLostTicks);
     UART0_writeString(" autoCenter=");
     UART0_writeDec32(g_abcdCenterTicks);
+    UART0_writeString(" autoYawOk=");
+    UART0_writeDec32(g_abcdYawTicks);
+    UART0_writeString(" autoWhite=");
+    UART0_writeDec32(g_abcdWhiteReady);
     UART0_writeString(" point=");
     UART0_writeDec32(g_abcdPointCount);
     UART0_writeString("\r\n");
@@ -1763,7 +2143,10 @@ int main(void)
         }
 
         statusElapsedMs += 1U;
-        if (statusElapsedMs >= STATUS_PRINT_PERIOD_MS) {
+        uint32_t statusPeriodMs =
+            (g_driveMode == DRIVE_AUTO) ? AUTO_STATUS_PRINT_PERIOD_MS
+                                        : STATUS_PRINT_PERIOD_MS;
+        if (statusElapsedMs >= statusPeriodMs) {
             statusElapsedMs = 0U;
             step6_printStatus();
         }

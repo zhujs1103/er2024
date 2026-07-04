@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""ER2024 串口监视器 — 连开发板 CH340 (COM9, 9600-8N1)"""
+"""ER2024 串口监视器 — 连开发板 CH340 (COM9, 115200-8N1)"""
 import serial
 import sys
 import time
 
 PORT = "COM9"
-BAUD = 9600
+BAUD = 115200
 
 def main():
     print(f"\n{'='*50}")

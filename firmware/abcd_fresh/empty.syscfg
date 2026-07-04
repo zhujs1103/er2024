@@ -171,14 +171,14 @@ PWM1.peripheral.$assign                        = "TIMA0";
 PWM1.peripheral.ccp0Pin.$assign                = "PA8";
 PWM1.peripheral.ccp1Pin.$assign                = "PA9";
 
-// ===== UART0 (PA10 TX, PA11 RX, 9600-8N1) =====
+// ===== UART0 (PA10 TX, PA11 RX, 115200-8N1) =====
 UART1.$name                    = "UART_0";
 UART1.peripheral.$assign       = "UART0";
 UART1.peripheral.txPin.$assign = "PA10";
 UART1.peripheral.rxPin.$assign = "PA11";
 UART1.uartClkSrc               = "MFCLK";
 UART1.uartClkDiv               = "1";
-UART1.targetBaudRate           = 9600;
+UART1.targetBaudRate           = 115200;
 UART1.wordLength               = "8_BITS";
 UART1.parity                   = "NONE";
 UART1.stopBits                 = "ONE";

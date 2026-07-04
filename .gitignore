@@ -29,6 +29,10 @@ keil/*.map
 Thumbs.db
 Desktop.ini
 
+# === Python cache ===
+__pycache__/
+*.py[cod]
+
 # === Temp / reference code (not yours) ===
 tmp/
 

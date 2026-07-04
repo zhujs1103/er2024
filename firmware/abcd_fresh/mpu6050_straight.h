@@ -39,6 +39,7 @@ mpu6050_straight_init_result_t mpu6050_straight_startup_init(void);
 void mpu6050_straight_reset(void);
 void mpu6050_straight_force_idle(void);
 int16_t mpu6050_straight_update(uint32_t periodMs);
+int16_t mpu6050_straight_correction_from_error(int32_t yawErrorDeg100);
 const mpu6050_straight_state_t *mpu6050_straight_state(void);
 
 #endif /* MPU6050_STRAIGHT_H */

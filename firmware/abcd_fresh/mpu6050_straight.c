@@ -33,9 +33,9 @@
 #define MPU6050_CALIBRATION_PERIOD_MS  (20U)
 #define MPU6050_MIN_CALIBRATION_OK     (60U)
 #define MPU6050_GYRO_LSB_PER_DPS       (131L)
-#define MPU6050_STRAIGHT_KZ_NUM        (4L)
+#define MPU6050_STRAIGHT_KZ_NUM        (1L)
 #define MPU6050_STRAIGHT_KZ_DEN        (100L)
-#define MPU6050_STRAIGHT_KYAW_NUM      (0L)
+#define MPU6050_STRAIGHT_KYAW_NUM      (5L)
 #define MPU6050_STRAIGHT_KYAW_DEN      (100L)
 #define MPU6050_STRAIGHT_CORR_MAX      (40)
 #define MPU6050_YAW_LIMIT_DEG100       (3000L)
@@ -435,11 +435,24 @@ void mpu6050_straight_force_idle(void)
     g_mpuState.correction = 0;
 }
 
+int16_t mpu6050_straight_correction_from_error(int32_t yawErrorDeg100)
+{
+    int32_t correction;
+
+    correction = (g_mpuState.yawRateDps100 * MPU6050_STRAIGHT_KZ_NUM) /
+                 MPU6050_STRAIGHT_KZ_DEN;
+    correction += (yawErrorDeg100 * MPU6050_STRAIGHT_KYAW_NUM) /
+                  MPU6050_STRAIGHT_KYAW_DEN;
+
+    return clampInt16(correction,
+                      -MPU6050_STRAIGHT_CORR_MAX,
+                      MPU6050_STRAIGHT_CORR_MAX);
+}
+
 int16_t mpu6050_straight_update(uint32_t periodMs)
 {
     mpu6050_sample_t sample;
     int32_t rateRaw;
-    int32_t correction;
 
     if (g_mpuState.ready == 0U) {
         g_mpuState.correction = 0;
@@ -467,13 +480,8 @@ int16_t mpu6050_straight_update(uint32_t periodMs)
                                        -MPU6050_YAW_LIMIT_DEG100,
                                        MPU6050_YAW_LIMIT_DEG100);
 
-    correction = (g_mpuState.yawRateDps100 * MPU6050_STRAIGHT_KZ_NUM) /
-                 MPU6050_STRAIGHT_KZ_DEN;
-    correction += (g_mpuState.yawDeg100 * MPU6050_STRAIGHT_KYAW_NUM) /
-                  MPU6050_STRAIGHT_KYAW_DEN;
-    g_mpuState.correction = clampInt16(correction,
-                                       -MPU6050_STRAIGHT_CORR_MAX,
-                                       MPU6050_STRAIGHT_CORR_MAX);
+    g_mpuState.correction =
+        mpu6050_straight_correction_from_error(g_mpuState.yawDeg100);
 
     return g_mpuState.correction;
 }

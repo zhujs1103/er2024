@@ -9,5 +9,6 @@ This folder tracks planning, risks, AI usage, and cross-document notes.
 - `development_environment.md` - local MSPM0/Keil/SysConfig toolchain status and setup scripts.
 - `purchase_list.md` - buying checklist for the first hardware order.
 - `senior_code_reference.md` - notes from prior completed MSPM0G3507 contest projects and how to adapt them.
+- `abcd_auto_debug_handoff_2026-07-04.md` - current handoff for continuing A-mode ABCDA loop debugging.
 - `ai_usage_log.md` - AI/agent usage notes for the design report.
 - `chatgpt_context.md` - status and intended use of the shared ChatGPT conversation.

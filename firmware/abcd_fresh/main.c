@@ -68,6 +68,10 @@
 #define LINE_PID_PERIOD_MS        (20U)    /* 50 Hz line/PID control loop */
 #define LED_TOGGLE_PERIOD_MS      (500U)
 #define LAP_DONE_LED_PERIOD_MS    (100U)
+#define UI_FAST_BLINK_PERIOD_MS   (100U)
+#define BUTTON_START_DEBOUNCE_MS    (30U)
+#define BUTTON_START_COUNTDOWN_MS   (3000U)
+#define BUTTON_START_AUTO_DELAY_MS  (450U)
 #define LINE_SENSOR_SETTLE_US     (50U)
 #define LINE_SENSOR_CHANNEL_COUNT (8U)
 #define STEP7_LOST_GRACE_MS       (300U)
@@ -100,7 +104,17 @@
 #define STEP7_GAP_BALANCE_BIAS_STEP    (5)
 #define STEP7_GAP_BLACK_CONFIRM_TICKS  (3U)
 
-#define ER2024_FW_BUILD_TAG "2026-07-04-abcd-fresh-cd-yaw-153"
+#define ER2024_FW_BUILD_TAG "2026-07-05-abcd-fresh-b21-auto-start-test"
+
+#define UI_BUZZER_PORT            (GPIOA)
+#define UI_BUZZER_PIN             (DL_GPIO_PIN_2)
+#define UI_BUZZER_IOMUX           (IOMUX_PINCM7)
+#define UI_LED_PORT               (GPIOA)
+#define UI_LED_PIN                (DL_GPIO_PIN_14)
+#define UI_LED_IOMUX              (IOMUX_PINCM36)
+#define BUTTON_START_PORT         (GPIOB)
+#define BUTTON_START_PIN          (DL_GPIO_PIN_21)
+#define BUTTON_START_IOMUX        (IOMUX_PINCM49)
 
 #define ABCD_WHITE_BLACK_MIN_TICKS     (1200)
 #define ABCD_WHITE_BLACK_MAX_TICKS     (1900)
@@ -184,6 +198,21 @@ typedef enum {
     ABCD_STATE_FAIL
 } abcd_state_t;
 
+typedef enum {
+    UI_FEEDBACK_NONE = 0,
+    UI_FEEDBACK_BOOT,
+    UI_FEEDBACK_AUTO_START,
+    UI_FEEDBACK_CAL_OK,
+    UI_FEEDBACK_DONE,
+    UI_FEEDBACK_FAIL
+} ui_feedback_pattern_t;
+
+typedef enum {
+    BUTTON_START_IDLE = 0,
+    BUTTON_START_COUNTDOWN,
+    BUTTON_START_AUTO_PENDING
+} button_start_state_t;
+
 typedef struct {
     uint8_t       raw;
     uint8_t       activeCount;
@@ -245,6 +274,17 @@ static int32_t       g_abcdYawDeg100 = 0;
 static int32_t       g_abcdYawTargetDeg100 = 0;
 static int32_t       g_abcdYawErrorDeg100 = 0;
 static int32_t       g_abcdHoldYawDeg100 = 0;
+static ui_feedback_pattern_t g_uiFeedbackPattern = UI_FEEDBACK_NONE;
+static uint16_t      g_uiFeedbackElapsedMs = 0U;
+static uint16_t      g_uiBlinkElapsedMs = 0U;
+static uint8_t       g_uiFastBlink = 0U;
+static uint8_t       g_uiBlinkOn = 0U;
+static button_start_state_t g_buttonStartState = BUTTON_START_IDLE;
+static uint32_t      g_buttonStartElapsedMs = 0U;
+static uint8_t       g_buttonRawPressed = 0U;
+static uint8_t       g_buttonStablePressed = 0U;
+static uint16_t      g_buttonDebounceMs = 0U;
+static uint8_t       g_buttonCountdownSecond = 0U;
 
 static uint8_t g_motorSwapSides   = STEP6_SWAP_MOTOR_SIDES_DEFAULT;
 static uint8_t g_motorInvertA     = STEP6_INVERT_MOTOR_A_DEFAULT;
@@ -260,6 +300,174 @@ static void abcd_clearAutoRun(void);
 static void abcd_brake(abcd_state_t state, const char *reason);
 static void abcd_startAutoRun(void);
 static void imuPrintState(void);
+static void uiFeedback_clear(void);
+static void uiFeedback_playBoot(void);
+static void uiFeedback_playAutoStart(void);
+static void uiFeedback_playCalOk(void);
+static void uiFeedback_playDone(void);
+static void uiFeedback_playFail(void);
+static void buttonStart_init(void);
+static void buttonStart_update1ms(void);
+static mpu6050_straight_init_result_t imuRunStillCalibrationCore(void);
+
+static void uiFeedback_setOutputs(uint8_t buzzerOn, uint8_t ledOn)
+{
+    if (buzzerOn != 0U) {
+        DL_GPIO_clearPins(UI_BUZZER_PORT, UI_BUZZER_PIN);
+    } else {
+        DL_GPIO_setPins(UI_BUZZER_PORT, UI_BUZZER_PIN);
+    }
+
+    if (ledOn != 0U) {
+        DL_GPIO_setPins(UI_LED_PORT, UI_LED_PIN);
+    } else {
+        DL_GPIO_clearPins(UI_LED_PORT, UI_LED_PIN);
+    }
+}
+
+static void uiFeedback_init(void)
+{
+    DL_GPIO_initDigitalOutputFeatures(UI_BUZZER_IOMUX,
+                                      DL_GPIO_INVERSION_DISABLE,
+                                      DL_GPIO_RESISTOR_PULL_UP,
+                                      DL_GPIO_DRIVE_STRENGTH_LOW,
+                                      DL_GPIO_HIZ_DISABLE);
+    DL_GPIO_initDigitalOutputFeatures(UI_LED_IOMUX,
+                                      DL_GPIO_INVERSION_DISABLE,
+                                      DL_GPIO_RESISTOR_PULL_DOWN,
+                                      DL_GPIO_DRIVE_STRENGTH_LOW,
+                                      DL_GPIO_HIZ_DISABLE);
+
+    DL_GPIO_setPins(UI_BUZZER_PORT, UI_BUZZER_PIN);
+    DL_GPIO_clearPins(UI_LED_PORT, UI_LED_PIN);
+    DL_GPIO_enableOutput(UI_BUZZER_PORT, UI_BUZZER_PIN);
+    DL_GPIO_enableOutput(UI_LED_PORT, UI_LED_PIN);
+
+    uiFeedback_clear();
+}
+
+static void uiFeedback_start(ui_feedback_pattern_t pattern)
+{
+    g_uiFeedbackPattern = pattern;
+    g_uiFeedbackElapsedMs = 0U;
+    g_uiBlinkElapsedMs = 0U;
+    g_uiFastBlink = 0U;
+    g_uiBlinkOn = 0U;
+    uiFeedback_setOutputs(0U, 0U);
+}
+
+static void uiFeedback_clear(void)
+{
+    g_uiFeedbackPattern = UI_FEEDBACK_NONE;
+    g_uiFeedbackElapsedMs = 0U;
+    g_uiBlinkElapsedMs = 0U;
+    g_uiFastBlink = 0U;
+    g_uiBlinkOn = 0U;
+    uiFeedback_setOutputs(0U, 0U);
+}
+
+static void uiFeedback_playBoot(void)
+{
+    uiFeedback_start(UI_FEEDBACK_BOOT);
+}
+
+static void uiFeedback_playAutoStart(void)
+{
+    uiFeedback_start(UI_FEEDBACK_AUTO_START);
+}
+
+static void uiFeedback_playCalOk(void)
+{
+    uiFeedback_start(UI_FEEDBACK_CAL_OK);
+}
+
+static void uiFeedback_playDone(void)
+{
+    uiFeedback_start(UI_FEEDBACK_DONE);
+}
+
+static void uiFeedback_playFail(void)
+{
+    uiFeedback_start(UI_FEEDBACK_FAIL);
+}
+
+static void uiFeedback_finish(uint8_t fastBlink)
+{
+    g_uiFeedbackPattern = UI_FEEDBACK_NONE;
+    g_uiFeedbackElapsedMs = 0U;
+    g_uiBlinkElapsedMs = 0U;
+    g_uiFastBlink = fastBlink;
+    g_uiBlinkOn = 0U;
+    uiFeedback_setOutputs(0U, 0U);
+}
+
+static void uiFeedback_updateFastBlink(void)
+{
+    if (g_uiFastBlink == 0U) {
+        uiFeedback_setOutputs(0U, 0U);
+        return;
+    }
+
+    g_uiBlinkElapsedMs++;
+    if (g_uiBlinkElapsedMs >= UI_FAST_BLINK_PERIOD_MS) {
+        g_uiBlinkElapsedMs = 0U;
+        g_uiBlinkOn ^= 1U;
+    }
+
+    uiFeedback_setOutputs(0U, g_uiBlinkOn);
+}
+
+static void uiFeedback_update1ms(void)
+{
+    uint8_t active = 0U;
+
+    switch (g_uiFeedbackPattern) {
+        case UI_FEEDBACK_BOOT:
+        case UI_FEEDBACK_AUTO_START:
+            active = (g_uiFeedbackElapsedMs < 80U) ? 1U : 0U;
+            uiFeedback_setOutputs(active, active);
+            g_uiFeedbackElapsedMs++;
+            if (g_uiFeedbackElapsedMs >= 120U) {
+                uiFeedback_finish(0U);
+            }
+            break;
+
+        case UI_FEEDBACK_CAL_OK:
+            active = (((g_uiFeedbackElapsedMs < 80U) ||
+                       ((g_uiFeedbackElapsedMs >= 200U) &&
+                        (g_uiFeedbackElapsedMs < 280U)))) ? 1U : 0U;
+            uiFeedback_setOutputs(active, active);
+            g_uiFeedbackElapsedMs++;
+            if (g_uiFeedbackElapsedMs >= 420U) {
+                uiFeedback_finish(0U);
+            }
+            break;
+
+        case UI_FEEDBACK_DONE:
+            active = (g_uiFeedbackElapsedMs < 350U) ? 1U : 0U;
+            uiFeedback_setOutputs(active, active);
+            g_uiFeedbackElapsedMs++;
+            if (g_uiFeedbackElapsedMs >= 450U) {
+                uiFeedback_finish(1U);
+            }
+            break;
+
+        case UI_FEEDBACK_FAIL:
+            active = ((g_uiFeedbackElapsedMs < 600U) &&
+                      ((g_uiFeedbackElapsedMs % 200U) < 80U)) ? 1U : 0U;
+            uiFeedback_setOutputs(active, active);
+            g_uiFeedbackElapsedMs++;
+            if (g_uiFeedbackElapsedMs >= 650U) {
+                uiFeedback_finish(1U);
+            }
+            break;
+
+        case UI_FEEDBACK_NONE:
+        default:
+            uiFeedback_updateFastBlink();
+            break;
+    }
+}
 
 static uint16_t motorPwmCompareFromSpeed(int16_t speed)
 {
@@ -751,6 +959,7 @@ static void step7_printLapParams(void)
 
 static void step7_startLapRun(void)
 {
+    uiFeedback_clear();
     abcd_clearAutoRun();
     step7_clearGapTest();
     step7_resetOdom();
@@ -766,6 +975,7 @@ static void step7_startLapRun(void)
 
 static void step7_startGapToBlackRun(void)
 {
+    uiFeedback_clear();
     abcd_clearAutoRun();
     step7_resetOdom();
     g_lapActive = 0U;
@@ -798,6 +1008,7 @@ static uint8_t step7_checkLapStop(void)
     g_lapDone   = 1U;
     motorBrake();
     linePid_reset();
+    uiFeedback_playDone();
 
     UART0_writeString("\r\n[LAP] target reached; brake at odom=");
     UART0_writeDec32(g_lastOdomTicks);
@@ -1132,6 +1343,11 @@ static void abcd_brake(abcd_state_t state, const char *reason)
     motorBrake();
     linePid_reset();
     g_gapTestState = GAP_TEST_OFF;
+    if (state == ABCD_STATE_DONE) {
+        uiFeedback_playDone();
+    } else {
+        uiFeedback_playFail();
+    }
 
     UART0_writeString("\r\n[AUTO] ");
     UART0_writeString(reason);
@@ -1352,6 +1568,7 @@ static void abcd_startAutoRun(void)
 {
     const mpu6050_straight_state_t *mpu = mpu6050_straight_state();
 
+    uiFeedback_clear();
     step7_clearGapTest();
     g_lapActive = 0U;
     g_lapDone = 0U;
@@ -1361,6 +1578,7 @@ static void abcd_startAutoRun(void)
 
     if (mpu->ready == 0U) {
         g_driveMode = DRIVE_STANDBY;
+        uiFeedback_playFail();
         UART0_writeString("\r\n[AUTO] IMU not ready; send uppercase I first\r\n");
         imuPrintState();
         return;
@@ -1375,6 +1593,7 @@ static void abcd_startAutoRun(void)
 
     UART0_writeString("\r\n[AUTO] ABCD fresh run armed; IMU yaw targets enabled\r\n");
     abcd_enterState(ABCD_STATE_AB_STRAIGHT);
+    uiFeedback_playAutoStart();
     abcd_printEvent("start");
 }
 
@@ -1630,6 +1849,7 @@ static void step6_printOrientation(void)
 
 static void step6_stopForOrientationChange(void)
 {
+    uiFeedback_clear();
     g_driveMode = DRIVE_STANDBY;
     g_lapActive = 0U;
     g_lapDone   = 0U;
@@ -1679,6 +1899,7 @@ static void imuPrintState(void)
 
 static void imuStopMotionForCheck(void)
 {
+    uiFeedback_clear();
     abcd_clearAutoRun();
     step7_clearGapTest();
     g_lapActive = 0U;
@@ -1688,11 +1909,10 @@ static void imuStopMotionForCheck(void)
     linePid_reset();
 }
 
-static void imuRunStartupCheck(void)
+static mpu6050_straight_init_result_t imuRunStillCalibrationCore(void)
 {
     mpu6050_straight_init_result_t result;
 
-    imuStopMotionForCheck();
     UART0_writeString("\r\n[IMU] keep car still; calibrating gyroZ for about 2 seconds...\r\n");
     result = mpu6050_straight_startup_init();
     UART0_writeString("[IMU] init=");
@@ -1707,6 +1927,203 @@ static void imuRunStartupCheck(void)
     }
 
     imuPrintState();
+    return result;
+}
+
+static void imuRunStartupCheck(void)
+{
+    imuStopMotionForCheck();
+    (void)imuRunStillCalibrationCore();
+}
+
+static uint8_t buttonStart_readPressed(void)
+{
+    return (DL_GPIO_readPins(BUTTON_START_PORT, BUTTON_START_PIN) == 0U) ?
+               1U :
+               0U;
+}
+
+static void buttonStart_init(void)
+{
+    DL_GPIO_initDigitalInputFeatures(BUTTON_START_IOMUX,
+                                     DL_GPIO_INVERSION_DISABLE,
+                                     DL_GPIO_RESISTOR_PULL_UP,
+                                     DL_GPIO_HYSTERESIS_DISABLE,
+                                     DL_GPIO_WAKEUP_DISABLE);
+
+    g_buttonRawPressed = buttonStart_readPressed();
+    g_buttonStablePressed = g_buttonRawPressed;
+    g_buttonDebounceMs = BUTTON_START_DEBOUNCE_MS;
+}
+
+static uint8_t buttonStart_pollPressedEvent(void)
+{
+    uint8_t rawPressed = buttonStart_readPressed();
+
+    if (rawPressed != g_buttonRawPressed) {
+        g_buttonRawPressed = rawPressed;
+        g_buttonDebounceMs = 0U;
+        return 0U;
+    }
+
+    if (g_buttonDebounceMs < BUTTON_START_DEBOUNCE_MS) {
+        g_buttonDebounceMs++;
+        return 0U;
+    }
+
+    if (g_buttonStablePressed == g_buttonRawPressed) {
+        return 0U;
+    }
+
+    g_buttonStablePressed = g_buttonRawPressed;
+    return (g_buttonStablePressed != 0U) ? 1U : 0U;
+}
+
+static void buttonStart_stopMotion(void)
+{
+    abcd_clearAutoRun();
+    step7_clearGapTest();
+    g_lapActive = 0U;
+    g_lapDone = 0U;
+    g_driveMode = DRIVE_STANDBY;
+    motorStop();
+    linePid_reset();
+}
+
+static void buttonStart_beginCountdown(void)
+{
+    uiFeedback_clear();
+    buttonStart_stopMotion();
+    g_buttonStartState = BUTTON_START_COUNTDOWN;
+    g_buttonStartElapsedMs = 0U;
+    g_buttonCountdownSecond = 0U;
+
+    uiFeedback_playAutoStart();
+    UART0_writeString("\r\n[BTN] B21 accepted; IMU calibration starts in 3 seconds. Keep car still.\r\n");
+}
+
+static void buttonStart_cancelCountdown(void)
+{
+    g_buttonStartState = BUTTON_START_IDLE;
+    g_buttonStartElapsedMs = 0U;
+    g_buttonCountdownSecond = 0U;
+    uiFeedback_clear();
+    buttonStart_stopMotion();
+    UART0_writeString("\r\n[BTN] countdown cancelled\r\n");
+}
+
+static void buttonStart_brakeMovingMode(void)
+{
+    g_buttonStartState = BUTTON_START_IDLE;
+    g_buttonStartElapsedMs = 0U;
+    g_buttonCountdownSecond = 0U;
+    abcd_clearAutoRun();
+    step7_clearGapTest();
+    g_lapActive = 0U;
+    g_lapDone = 0U;
+    g_driveMode = DRIVE_BRAKE;
+    motorBrake();
+    linePid_reset();
+    uiFeedback_playFail();
+    UART0_writeString("\r\n[BTN] moving mode interrupted; brake only, no IMU calibration\r\n");
+}
+
+static void buttonStart_runCalibrationThenAuto(void)
+{
+    mpu6050_straight_init_result_t result;
+
+    g_buttonStartState = BUTTON_START_IDLE;
+    g_buttonStartElapsedMs = 0U;
+    g_buttonCountdownSecond = 0U;
+    buttonStart_stopMotion();
+
+    UART0_writeString("\r\n[BTN] countdown complete; IMU calibration then A auto start\r\n");
+    result = imuRunStillCalibrationCore();
+
+    if (result == MPU6050_STRAIGHT_INIT_OK) {
+        g_buttonStartState = BUTTON_START_AUTO_PENDING;
+        g_buttonStartElapsedMs = 0U;
+        g_buttonCountdownSecond = 0U;
+        uiFeedback_playCalOk();
+        UART0_writeString("[BTN] IMU calibration OK; A mode starts after feedback\r\n");
+    } else {
+        uiFeedback_playFail();
+        UART0_writeString("[BTN] IMU calibration failed; A mode not started\r\n");
+    }
+}
+
+static void buttonStart_cancelPendingAuto(void)
+{
+    g_buttonStartState = BUTTON_START_IDLE;
+    g_buttonStartElapsedMs = 0U;
+    g_buttonCountdownSecond = 0U;
+    uiFeedback_clear();
+    buttonStart_stopMotion();
+    UART0_writeString("\r\n[BTN] pending A auto start cancelled\r\n");
+}
+
+static void buttonStart_updateCountdown1ms(void)
+{
+    uint8_t secondsElapsed;
+
+    g_buttonStartElapsedMs++;
+    secondsElapsed = (uint8_t)(g_buttonStartElapsedMs / 1000U);
+    if ((secondsElapsed > g_buttonCountdownSecond) &&
+        (g_buttonStartElapsedMs < BUTTON_START_COUNTDOWN_MS)) {
+        uint32_t secondsRemaining =
+            (BUTTON_START_COUNTDOWN_MS - g_buttonStartElapsedMs + 999U) / 1000U;
+        g_buttonCountdownSecond = secondsElapsed;
+        uiFeedback_playAutoStart();
+        UART0_writeString("[BTN] countdown ");
+        UART0_writeDec32((int32_t)secondsRemaining);
+        UART0_writeString("\r\n");
+    }
+
+    if (g_buttonStartElapsedMs >= BUTTON_START_COUNTDOWN_MS) {
+        buttonStart_runCalibrationThenAuto();
+    }
+}
+
+static void buttonStart_updateAutoPending1ms(void)
+{
+    g_buttonStartElapsedMs++;
+    if (g_buttonStartElapsedMs >= BUTTON_START_AUTO_DELAY_MS) {
+        g_buttonStartState = BUTTON_START_IDLE;
+        g_buttonStartElapsedMs = 0U;
+        g_buttonCountdownSecond = 0U;
+        abcd_startAutoRun();
+    }
+}
+
+static void buttonStart_update1ms(void)
+{
+    uint8_t pressedEvent = buttonStart_pollPressedEvent();
+
+    if (pressedEvent != 0U) {
+        if (g_buttonStartState == BUTTON_START_COUNTDOWN) {
+            buttonStart_cancelCountdown();
+            return;
+        }
+
+        if (g_buttonStartState == BUTTON_START_AUTO_PENDING) {
+            buttonStart_cancelPendingAuto();
+            return;
+        }
+
+        if ((g_driveMode != DRIVE_STANDBY) && (g_driveMode != DRIVE_BRAKE)) {
+            buttonStart_brakeMovingMode();
+            return;
+        }
+
+        buttonStart_beginCountdown();
+        return;
+    }
+
+    if (g_buttonStartState == BUTTON_START_COUNTDOWN) {
+        buttonStart_updateCountdown1ms();
+    } else if (g_buttonStartState == BUTTON_START_AUTO_PENDING) {
+        buttonStart_updateAutoPending1ms();
+    }
 }
 
 static void imuRunSampleCheck(void)
@@ -1729,6 +2146,7 @@ static void imuStartStraightRun(void)
 {
     const mpu6050_straight_state_t *mpu = mpu6050_straight_state();
 
+    uiFeedback_clear();
     abcd_clearAutoRun();
     step7_clearGapTest();
     g_lapActive = 0U;
@@ -1769,6 +2187,7 @@ static void step6_handleCommand(uint8_t cmd)
             step7_startLapRun();
             break;
         case 'G':
+            uiFeedback_clear();
             abcd_clearAutoRun();
             step7_clearGapTest();
             g_lapActive = 0U;
@@ -1778,6 +2197,7 @@ static void step6_handleCommand(uint8_t cmd)
             UART0_writeString("\r\n[RUN] continuous line PID armed\r\n");
             break;
         case 'f':
+            uiFeedback_clear();
             abcd_clearAutoRun();
             step7_clearGapTest();
             g_lapActive = 0U;
@@ -1801,6 +2221,7 @@ static void step6_handleCommand(uint8_t cmd)
             break;
         case 'v':
         case 'V':
+            uiFeedback_clear();
             abcd_clearAutoRun();
             step7_clearGapTest();
             g_lapActive = 0U;
@@ -1811,6 +2232,7 @@ static void step6_handleCommand(uint8_t cmd)
             break;
         case 'x':
         case 'X':
+            uiFeedback_clear();
             abcd_clearAutoRun();
             step7_clearGapTest();
             g_lapActive = 0U;
@@ -1822,6 +2244,7 @@ static void step6_handleCommand(uint8_t cmd)
             break;
         case 'b':
         case 'B':
+            uiFeedback_clear();
             abcd_clearAutoRun();
             step7_clearGapTest();
             g_lapActive = 0U;
@@ -1933,6 +2356,7 @@ static void step6_handleCommand(uint8_t cmd)
             break;
         case 'r':
         case 'R':
+            uiFeedback_clear();
             step7_resetOdom();
             abcd_clearAutoRun();
             step7_clearGapTest();
@@ -2100,6 +2524,8 @@ int main(void)
 {
     SYSCFG_DL_init();
     motorStop();
+    uiFeedback_init();
+    buttonStart_init();
     DL_TimerA_startCounter(PWM_MOTORS_INST);
 
     NVIC_ClearPendingIRQ(UART_0_INST_INT_IRQN);
@@ -2124,10 +2550,13 @@ int main(void)
                       "  STBY:PB20\r\n");
     UART0_writeString("Enc: HW-A=PB17/18 HW-B=PB24/25; logical sides use orient flags\r\n");
     UART0_writeString("Line: black=1; sensorFlip decides logical left/right\r\n");
+    UART0_writeString("UI: PA2 active-low buzzer, PA14 external LED\r\n");
+    UART0_writeString("Button: B21/PB21 active-low starts countdown + IMU calibration + A auto\r\n");
     UART0_printHelp();
     step6_printParams();
     step6_printOrientation();
     UART0_writeString("Boot mode is STBY. Send 'A' for ABCD or 'F'/'G' for checks.\r\n\r\n");
+    uiFeedback_playBoot();
 
     while (1) {
         if (g_uartCommand != 0U) {
@@ -2135,6 +2564,8 @@ int main(void)
             g_uartCommand = 0U;
             step6_handleCommand(cmd);
         }
+
+        buttonStart_update1ms();
 
         pidElapsedMs += 1U;
         if (pidElapsedMs >= LINE_PID_PERIOD_MS) {
@@ -2161,6 +2592,7 @@ int main(void)
             DL_GPIO_togglePins(GPIO_LED_PORT, GPIO_LED_LED1_PIN);
         }
 
+        uiFeedback_update1ms();
         delay_ms(1U);
     }
 }

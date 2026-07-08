@@ -1,29 +1,94 @@
-# BUPT 2026 Electronics Design Contest - Line Tracking Work Platform
+# BUPT 2026 电子设计竞赛 — 巡迹作业一体平台
 
-This workspace is organized as the project notebook for the BUPT 2026 electronics design contest car-track problem.
+🏆 北京邮电大学 2026 年电子设计竞赛小车赛道题目参赛作品
+👥 队伍成员：朱锦松、郑洢陈、杨照基
+📅 2026 年 7 月
 
-## Directory Map
+## 项目概述
 
-- `competition_requirements/`
-  - Official problem statement, extracted requirements, scoring table, and rendered PDF pages.
-- `hardware_docs/`
-  - Hardware manuals, datasheets, wiring notes, and module decisions.
-- `firmware/`
-  - Keil/SysConfig firmware projects and board bring-up source.
-- `project_management/`
-  - Roadmap, risks, AI usage log, and notes from external conversations.
-- `tmp/`
-  - Temporary extraction/rendering files. Do not treat this as source-of-truth documentation.
+以 TI MSPM0G3507 为主控制器的轮式巡迹小车，采用非视觉灰度传感器巡线 + 编码器里程计 + MPU6050 IMU 航向保持 + K230 视觉辅助瞄准的技术路线，实现了自动巡迹、定点瞄准、巡迹联动、四圈连续运行和靶面同步绘制等功能。
 
-## Current Baseline Direction
+**最终得分：85/110 分**（动态跟随因缺少无刷云台硬件未完成）
 
-Build the first reliable version around:
+## 目录结构
 
-- TI MCU as the main controller.
-- Wheeled differential-drive chassis.
-- Non-camera line tracking for driving.
-- Encoder/IMU-assisted key-point handling.
-- Two-axis servo gimbal or lightweight actuator for target pointing/marking.
-- Independent power control for the actuator module.
+```
+er2024/
+├── competition_requirements/   # 题目原文、需求整理、评分策略
+├── hardware_docs/              # 硬件手册、数据手册、接线方案、调试记录
+│   ├── 01_ti_mcu/              # MSPM0G3507 主控
+│   ├── 02_chassis_motors/      # 底盘与电机
+│   ├── 03_line_sensors/        # 灰度传感器
+│   ├── 04_motor_driver/        # TB6612 驱动
+│   ├── 05_servo_gimbal_actuator/ # 云台与激光
+│   ├── 06_power_safety/        # 供电与安全
+│   └── 07_ui_debug/            # 人机交互
+├── firmware/
+│   └── abcd_four_lap_finish_aim/  # 🎯 主力固件（四圈+最终A点K230瞄准）
+├── vision/                     # K230 MicroPython 视觉脚本
+│   ├── k230_a_finish_aim_handshake.py  # 四圈终点瞄准握手
+│   ├── k230_b_work_handshake.py        # B点定点作业握手
+│   └── k230_square_draw.py             # 靶面正方形绘制
+├── project_management/         # 项目管理文档
+│   ├── design_report.md        # 设计报告（Markdown 版）
+│   ├── roadmap.md              # 开发路线图
+│   ├── risk_register.md        # 风险登记
+│   └── ai_usage_log.md         # AI 工具使用记录
+├── report_assets/              # 报告素材
+│   ├── main.tex                # LaTeX 设计报告源文件
+│   ├── main.pdf                # 设计报告 PDF（21 页）
+│   ├── photos/                 # 小车照片（8 张）
+│   └── videos/                 # 演示视频（5 个）
+└── tmp/                        # 临时文件
+```
 
-The first milestone is not maximum score. It is a repeatable 60-point basic-function car that can pass: one-lap tracking, static target action, and A-B-C-D-A linked operation.
+## 技术栈
+
+| 模块 | 方案 |
+|------|------|
+| 主控 | TI MSPM0G3507（嘉立创·天猛星） |
+| 底盘 | 2WD 差速轮式，12V 520 编码器电机 |
+| 驱动 | TB6612FNG 双路直流电机驱动 |
+| 巡线 | Yahboom YB-MYX05-V1.0 8 路灰度传感器 |
+| 姿态 | MPU6050 (GY-521) 六轴 IMU |
+| 云台 | 二维 PWM 舵机云台（15kg 级） |
+| 激光 | 405nm 蓝紫色可调焦激光模块 |
+| 视觉 | K230 摄像头（仅用于末端瞄准辅助，不用于巡线） |
+| 编译 | Keil MDK v5.32 + SysConfig 1.28 + J-Link V9.54 |
+| 调试 | UART 115200-8N1 + 串口命令体系 |
+
+## 核心功能实现
+
+| 功能 | 分值 | 状态 | 关键技术 |
+|------|:---:|:----:|---------|
+| 自动巡迹与停车 | 20 | ✅ | PD 巡线 (Kp=55,Kd=35) + 编码器停车 |
+| 定点作业 | 20 | ✅ | K230 视觉闭环瞄准 + 激光 3s 射击 |
+| 巡迹到靶位联动 | 20 | ✅ | ABCD 七状态自动机，MSPM0-K230 GPIO 握手 |
+| 动态跟随 | 15 | ❌ | 缺无刷云台硬件 |
+| 同步绘制 | 15 | ✅ | K230 舵机路径规划，靶面正方形绘制 |
+| 四圈连续运行 | 10 | ✅ | Q 模式，每圈 yaw rebase，圈间 NEXT_AB=-303° |
+| 工程完善度 | ~10 | ✅ | 多模块独立供电、声光提示、串口调参 |
+
+## 开发历程
+
+本项目经历了完整的"从零到一"工程实践：
+
+1. **6/29** — J-Link 烧录链路打通，PB22 LED 点亮
+2. **6/30** — 电机驱动 + 编码器验证，TB6612 短刹车调通
+3. **7/1** — 地面 PD 巡线稳定（base=180, Kp=55, Kd=35）
+4. **7/2-4** — ABCD 状态机攻坚：完全重写、C 点假触发、CD 航向迭代（-180°→-150°）
+5. **7/8-9** — 通宵冲刺四圈+K230 瞄准，从"2+1"扩展至"3+2"
+
+开发期间经历校区搬迁硬件损坏、陀螺仪延迟到货等现实困难。详细记录见 `hardware_docs/` 各 step bringup record 和 `project_management/ai_usage_log.md`。
+
+## 提交材料
+
+提交包 (`er2024_提交材料.zip`, 56MB) 包含：
+- 设计报告 PDF（21 页 LaTeX）
+- 5 个演示视频
+- 8 张小车照片
+- 固件源码 + K230 脚本
+
+## 开源许可
+
+本项目代码和文档遵循 MIT License，供后续参赛同学参考交流。

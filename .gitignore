@@ -39,6 +39,23 @@ tmp/
 # === Codex local state ===
 .codex/
 
+# === Submission package (too large, regenerated as needed) ===
+er2024_提交材料.zip
+er2024_提交材料/
+
+# === Hermes desktop state ===
+.hermes/
+
+# === LaTeX build artifacts ===
+report_assets/main.aux
+report_assets/main.log
+report_assets/main.out
+report_assets/main.toc
+report_assets/main.pdf
+
+# === Large media (submitted separately) ===
+report_assets/videos/
+
 # === Agent local state ===
 .agents/
 
